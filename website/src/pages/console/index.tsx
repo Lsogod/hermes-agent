@@ -20,6 +20,7 @@ interface ConsoleSession {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+  toolEvents: ToolEvent[];
   serverSessionId?: string;
   totalUsage?: Usage;
 }
@@ -34,6 +35,7 @@ interface ToolEvent {
   duration?: number;
   error?: boolean;
   args?: string;
+  result?: string;
 }
 
 interface ImageAttachment {
@@ -132,6 +134,7 @@ function createSession(): ConsoleSession {
     createdAt: now,
     updatedAt: now,
     messages: [],
+    toolEvents: [],
   };
 }
 
@@ -431,7 +434,6 @@ export default function ConsolePage(): React.JSX.Element {
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [settings, setSettings] = useState<ConsoleSettings>(DEFAULT_SETTINGS);
   const [composer, setComposer] = useState('');
-  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [requestState, setRequestState] = useState<RequestState>({status: 'idle'});
   const [connectionState, setConnectionState] = useState<ConnectionState>({
     state: 'idle',
@@ -476,6 +478,7 @@ export default function ConsolePage(): React.JSX.Element {
       const restoredSessions = (parsed.sessions?.length ? parsed.sessions : [createSession()]).map((session) => ({
         ...session,
         title: session.title === 'New thread' ? '新会话' : session.title,
+        toolEvents: Array.isArray(session.toolEvents) ? session.toolEvents : [],
       }));
       const restoredSettings = parsed.settings ? {...DEFAULT_SETTINGS, ...parsed.settings} : DEFAULT_SETTINGS;
 
@@ -510,6 +513,7 @@ export default function ConsolePage(): React.JSX.Element {
     () => sessions.find((session) => session.id === currentSessionId) ?? sessions[0],
     [currentSessionId, sessions],
   );
+  const toolEvents = currentSession?.toolEvents ?? [];
 
   useEffect(() => {
     if (!currentSession && sessions.length) {
@@ -584,9 +588,23 @@ export default function ConsolePage(): React.JSX.Element {
     }));
   }
 
-  function appendToolEvent(event: {type?: string; tool: string; label?: string; emoji?: string; duration?: number; error?: boolean; args?: string}): void {
+  function patchSessionToolEvents(
+    sessionId: string,
+    updater: (events: ToolEvent[]) => ToolEvent[],
+  ): void {
+    patchSession(sessionId, (session) => ({
+      ...session,
+      updatedAt: Date.now(),
+      toolEvents: updater(session.toolEvents ?? []),
+    }));
+  }
+
+  function appendToolEvent(
+    sessionId: string,
+    event: {type?: string; tool: string; label?: string; emoji?: string; duration?: number; error?: boolean; args?: string; result?: string},
+  ): void {
     if (event.type === 'completed') {
-      setToolEvents((prev) => {
+      patchSessionToolEvents(sessionId, (prev) => {
         const idx = prev.findIndex((e) => e.tool === event.tool && e.type === 'started');
         if (idx >= 0) {
           const updated = [...prev];
@@ -595,17 +613,28 @@ export default function ConsolePage(): React.JSX.Element {
             type: 'completed',
             duration: event.duration,
             error: event.error,
+            result: event.result ?? updated[idx].result,
           };
           return updated;
         }
         return [
-          {id: makeId('tool'), type: 'completed', tool: event.tool, label: event.label ?? event.tool, emoji: event.emoji, timestamp: Date.now(), duration: event.duration, error: event.error},
+          {
+            id: makeId('tool'),
+            type: 'completed',
+            tool: event.tool,
+            label: event.label ?? event.tool,
+            emoji: event.emoji,
+            timestamp: Date.now(),
+            duration: event.duration,
+            error: event.error,
+            result: event.result,
+          },
           ...prev,
         ];
       });
       return;
     }
-    setToolEvents((prev) => [
+    patchSessionToolEvents(sessionId, (prev) => [
       {
         id: makeId('tool'),
         type: 'started',
@@ -614,6 +643,7 @@ export default function ConsolePage(): React.JSX.Element {
         emoji: event.emoji,
         timestamp: Date.now(),
         args: event.args,
+        result: event.result,
       },
       ...prev,
     ]);
@@ -727,8 +757,8 @@ export default function ConsolePage(): React.JSX.Element {
 
       if (eventName === 'hermes.tool.progress') {
         try {
-          const payload = JSON.parse(data) as {type?: string; tool: string; label?: string; emoji?: string; duration?: number; error?: boolean; args?: string};
-          appendToolEvent(payload);
+          const payload = JSON.parse(data) as {type?: string; tool: string; label?: string; emoji?: string; duration?: number; error?: boolean; args?: string; result?: string};
+          appendToolEvent(sessionId, payload);
           setRequestState((prev) => ({
             ...prev,
             status: prev.status === 'connecting' ? 'streaming' : prev.status,
@@ -864,7 +894,6 @@ export default function ConsolePage(): React.JSX.Element {
 
     setComposer('');
     setImageAttachment(null);
-    setToolEvents([]);
     setRequestState({
       status: 'connecting',
       startedAt: now,
@@ -1292,7 +1321,6 @@ export default function ConsolePage(): React.JSX.Element {
       }
       return next;
     });
-    setToolEvents([]);
     setRequestState({status: 'idle'});
   }
 
@@ -1301,7 +1329,6 @@ export default function ConsolePage(): React.JSX.Element {
     setSessions((prev) => [session, ...prev]);
     setCurrentSessionId(session.id);
     setComposer('');
-    setToolEvents([]);
     setRequestState({status: 'idle'});
   }
 
@@ -1317,11 +1344,11 @@ export default function ConsolePage(): React.JSX.Element {
       title: '新会话',
       updatedAt: Date.now(),
       messages: [],
+      toolEvents: [],
       serverSessionId: undefined,
       totalUsage: undefined,
     }));
     setComposer('');
-    setToolEvents([]);
     setRequestState({status: 'idle'});
   }
 
@@ -1429,7 +1456,6 @@ export default function ConsolePage(): React.JSX.Element {
                     className={styles.sessionContent}
                     onClick={() => {
                       setCurrentSessionId(session.id);
-                      setToolEvents([]);
                       setRequestState({status: 'idle'});
                     }}
                   >
@@ -1779,7 +1805,16 @@ hermes gateway`}</code>
                       </div>
                       {event.label && <p className={styles.traceLabel}>{event.label}</p>}
                       {event.args && (
-                        <pre className={styles.traceArgs}>{event.args}</pre>
+                        <>
+                          <p className={styles.traceMetaLabel}>输入</p>
+                          <pre className={styles.traceArgs}>{event.args}</pre>
+                        </>
+                      )}
+                      {event.result && (
+                        <>
+                          <p className={styles.traceMetaLabel}>输出</p>
+                          <pre className={styles.traceArgs}>{event.result}</pre>
+                        </>
                       )}
                     </div>
                   ))

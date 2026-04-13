@@ -109,6 +109,59 @@ from agent.trajectory import (
 from utils import atomic_json_write, env_var_enabled
 
 
+_TOOL_PROGRESS_RESULT_MAX_CHARS = 800
+
+
+def _truncate_tool_progress_text(text: Any, max_chars: int = _TOOL_PROGRESS_RESULT_MAX_CHARS) -> Optional[str]:
+    """Trim tool progress text to a bounded preview for UI/event payloads."""
+    if text is None:
+        return None
+    rendered = str(text).strip()
+    if not rendered:
+        return None
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 3].rstrip() + "..."
+
+
+def _summarize_tool_progress_result(result: Any) -> Optional[str]:
+    """Build a compact result preview for tool progress callbacks."""
+    if result is None:
+        return None
+
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            return _truncate_tool_progress_text(result)
+    else:
+        parsed = result
+
+    if isinstance(parsed, dict):
+        for key in ("message", "error", "summary", "content", "output", "result", "preview"):
+            preview = _truncate_tool_progress_text(parsed.get(key))
+            if preview:
+                return preview
+
+        entries = parsed.get("entries")
+        if isinstance(entries, list) and entries:
+            first_entry = _truncate_tool_progress_text(entries[0], max_chars=500)
+            if first_entry:
+                extra = len(entries) - 1
+                suffix = f"\n... (+{extra} more entries)" if extra > 0 else ""
+                return _truncate_tool_progress_text(f"{first_entry}{suffix}")
+
+        return _truncate_tool_progress_text(
+            json.dumps(parsed, ensure_ascii=False, indent=2)
+        )
+
+    if isinstance(parsed, list):
+        return _truncate_tool_progress_text(
+            json.dumps(parsed[:3], ensure_ascii=False, indent=2)
+        )
+
+    return _truncate_tool_progress_text(parsed)
+
 
 class _SafeWriter:
     """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
@@ -7077,9 +7130,11 @@ class AIAgent:
 
                 if self.tool_progress_callback:
                     try:
+                        result_preview = _summarize_tool_progress_result(function_result)
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            result_preview=result_preview,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -7411,9 +7466,11 @@ class AIAgent:
 
             if self.tool_progress_callback:
                 try:
+                    result_preview = _summarize_tool_progress_result(function_result)
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        result_preview=result_preview,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")

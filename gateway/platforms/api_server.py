@@ -767,13 +767,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 elif event_type == "tool.completed":
                     duration = kwargs.get("duration", 0)
                     is_error = kwargs.get("is_error", False)
-                    _stream_q.put(("__tool_progress__", {
+                    payload = {
                         "type": "completed",
                         "tool": name or "",
                         "emoji": emoji,
                         "duration": round(duration, 3) if duration else None,
                         "error": is_error,
-                    }))
+                    }
+                    result_preview = kwargs.get("result_preview")
+                    if result_preview:
+                        payload["result"] = result_preview
+                    _stream_q.put(("__tool_progress__", payload))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1563,22 +1567,29 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
-                _push({
+                payload = {
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
-                })
+                }
+                if args:
+                    payload["args"] = args
+                _push(payload)
             elif event_type == "tool.completed":
-                _push({
+                payload = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                result_preview = kwargs.get("result_preview")
+                if result_preview:
+                    payload["result"] = result_preview
+                _push(payload)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
