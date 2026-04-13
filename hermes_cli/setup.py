@@ -2231,6 +2231,7 @@ def setup_gateway(config: dict):
 
         from hermes_cli.gateway import (
             _is_service_installed,
+            _is_managed_service_running,
             _is_service_running,
             supports_systemd_services,
             has_conflicting_systemd_units,
@@ -2245,6 +2246,8 @@ def setup_gateway(config: dict):
 
         service_installed = _is_service_installed()
         service_running = _is_service_running()
+        managed_service_running = _is_managed_service_running()
+        manual_gateway_running = service_running and not managed_service_running
         supports_systemd = supports_systemd_services()
         supports_service_manager = supports_systemd or _is_macos
 
@@ -2253,7 +2256,7 @@ def setup_gateway(config: dict):
             print_systemd_scope_conflict_warning()
             print()
 
-        if service_running:
+        if managed_service_running:
             if prompt_yes_no("  Restart the gateway to pick up changes?", True):
                 try:
                     if supports_systemd:
@@ -2262,6 +2265,12 @@ def setup_gateway(config: dict):
                         launchd_restart()
                 except Exception as e:
                     print_error(f"  Restart failed: {e}")
+        elif manual_gateway_running:
+            svc_name = "systemd" if supports_systemd else "launchd" if _is_macos else "service manager"
+            print_info(f"  Gateway is already running manually (not as a {svc_name} service).")
+            print_info("  Restart it manually to pick up changes:")
+            print_info("    hermes gateway stop")
+            print_info("    hermes gateway run")
         elif service_installed:
             if prompt_yes_no("  Start the gateway service?", True):
                 try:

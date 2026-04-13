@@ -223,6 +223,66 @@ def test_setup_gateway_in_container_shows_docker_guidance(monkeypatch, capsys):
     assert "restart" in out.lower()
 
 
+def test_setup_gateway_does_not_restart_launchd_for_manual_run(monkeypatch, capsys):
+    env = {
+        "TELEGRAM_BOT_TOKEN": "token",
+        "TELEGRAM_HOME_CHANNEL": "",
+        "DISCORD_BOT_TOKEN": "",
+        "DISCORD_HOME_CHANNEL": "",
+        "SLACK_BOT_TOKEN": "",
+        "SLACK_HOME_CHANNEL": "",
+        "SIGNAL_HTTP_URL": "",
+        "EMAIL_ADDRESS": "",
+        "TWILIO_ACCOUNT_SID": "",
+        "MATTERMOST_TOKEN": "",
+        "MATRIX_ACCESS_TOKEN": "",
+        "MATRIX_PASSWORD": "",
+        "WHATSAPP_ENABLED": "",
+        "DINGTALK_CLIENT_ID": "",
+        "FEISHU_APP_ID": "",
+        "WECOM_BOT_ID": "",
+        "WEIXIN_ACCOUNT_ID": "",
+        "BLUEBUBBLES_SERVER_URL": "",
+        "BLUEBUBBLES_HOME_CHANNEL": "",
+        "WEBHOOK_ENABLED": "",
+    }
+
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
+    monkeypatch.setattr(
+        setup_mod,
+        "_GATEWAY_PLATFORMS",
+        [("Telegram", "TELEGRAM_BOT_TOKEN", lambda: None)],
+    )
+    monkeypatch.setattr(setup_mod, "prompt_checklist", lambda *args, **kwargs: [0])
+
+    def _unexpected_prompt(*args, **kwargs):
+        raise AssertionError(f"Unexpected prompt_yes_no call: {args[0] if args else ''}")
+
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", _unexpected_prompt)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+
+    import hermes_cli.gateway as gateway_mod
+
+    calls = []
+    monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway_mod, "is_macos", lambda: True)
+    monkeypatch.setattr(gateway_mod, "_is_service_installed", lambda: False)
+    monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: True)
+    monkeypatch.setattr(gateway_mod, "_is_managed_service_running", lambda: False)
+    monkeypatch.setattr(gateway_mod, "has_conflicting_systemd_units", lambda: False)
+    monkeypatch.setattr(gateway_mod, "launchd_restart", lambda: calls.append("restart"))
+    monkeypatch.setattr(gateway_mod, "launchd_start", lambda: calls.append("start"))
+    monkeypatch.setattr(gateway_mod, "launchd_install", lambda force=False: calls.append(("install", force)))
+
+    setup_mod.setup_gateway({})
+
+    out = capsys.readouterr().out
+    assert "running manually" in out
+    assert "hermes gateway stop" in out
+    assert "hermes gateway run" in out
+    assert calls == []
+
+
 def test_setup_syncs_custom_provider_removal_from_disk(tmp_path, monkeypatch):
     """Removing the last custom provider in model setup should persist."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

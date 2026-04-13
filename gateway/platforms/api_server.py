@@ -56,6 +56,8 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_SESSION_LIST_LIMIT = 200
+MAX_LOG_LINES = 500
 
 
 def _normalize_chat_content(
@@ -504,6 +506,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    @staticmethod
+    def _parse_bool_query(value: Optional[str]) -> bool:
+        """Parse a permissive boolean query-string flag."""
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -609,6 +618,347 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": [model_obj],
         })
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions — list persisted Hermes sessions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response({"sessions": []})
+
+        query = request.rel_url.query
+        source = (query.get("source") or "").strip() or None
+        exclude_sources = [
+            item.strip()
+            for item in (query.get("exclude_sources") or "").split(",")
+            if item.strip()
+        ] or None
+
+        try:
+            limit = max(1, min(int(query.get("limit", "80")), MAX_SESSION_LIST_LIMIT))
+            offset = max(0, int(query.get("offset", "0")))
+        except ValueError:
+            return web.json_response(
+                _openai_error("Invalid pagination parameter.", code="invalid_pagination"),
+                status=400,
+            )
+
+        include_children = self._parse_bool_query(query.get("include_children"))
+
+        try:
+            sessions = db.list_sessions_rich(
+                source=source,
+                exclude_sources=exclude_sources,
+                limit=limit,
+                offset=offset,
+                include_children=include_children,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] GET /api/sessions failed: %s", exc)
+            return web.json_response(
+                _openai_error("Failed to load sessions.", err_type="server_error", code="session_list_failed"),
+                status=500,
+            )
+
+        now = time.time()
+        for session in sessions:
+            last_active = session.get("last_active", session.get("started_at", 0)) or 0
+            session["is_active"] = (
+                session.get("ended_at") is None
+                and isinstance(last_active, (int, float))
+                and (now - last_active) < 300
+            )
+
+        return web.json_response({"sessions": sessions})
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id} — fetch session metadata."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable.", err_type="server_error", code="session_db_unavailable"),
+                status=503,
+            )
+
+        requested_id = request.match_info.get("session_id", "")
+        session_id = db.resolve_session_id(requested_id)
+        if not session_id:
+            return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+
+        session = db.get_session(session_id)
+        if not session:
+            return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+
+        last_active = session.get("last_active", session.get("started_at", 0)) or 0
+        session["is_active"] = (
+            session.get("ended_at") is None
+            and isinstance(last_active, (int, float))
+            and (time.time() - last_active) < 300
+        )
+        return web.json_response(session)
+
+    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/messages — fetch persisted session transcript."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable.", err_type="server_error", code="session_db_unavailable"),
+                status=503,
+            )
+
+        requested_id = request.match_info.get("session_id", "")
+        session_id = db.resolve_session_id(requested_id)
+        if not session_id:
+            return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+
+        try:
+            messages = db.get_messages(session_id)
+        except Exception as exc:
+            logger.exception("[api_server] GET /api/sessions/%s/messages failed: %s", session_id, exc)
+            return web.json_response(
+                _openai_error("Failed to load session messages.", err_type="server_error", code="session_messages_failed"),
+                status=500,
+            )
+
+        return web.json_response({"session_id": session_id, "messages": messages})
+
+    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions — create an empty persisted web session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable.", err_type="server_error", code="session_db_unavailable"),
+                status=503,
+            )
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        requested_id = body.get("session_id")
+        title = body.get("title")
+        source = str(body.get("source") or "api_server").strip() or "api_server"
+        model = str(body.get("model") or self._model_name).strip() or self._model_name
+        system_prompt = body.get("system_prompt")
+
+        if source != "api_server":
+            return web.json_response(_openai_error("Only api_server sessions can be created here.", code="invalid_session_source"), status=400)
+
+        if requested_id is not None and not isinstance(requested_id, str):
+            return web.json_response(_openai_error("session_id must be a string.", code="invalid_session_id"), status=400)
+        if title is not None and not isinstance(title, str):
+            return web.json_response(_openai_error("title must be a string.", code="invalid_session_title"), status=400)
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            return web.json_response(_openai_error("system_prompt must be a string.", code="invalid_system_prompt"), status=400)
+
+        session_id = (requested_id or f"web-{uuid.uuid4().hex[:16]}").strip()
+        if not session_id or re.search(r'[\r\n\x00]', session_id):
+            return web.json_response(_openai_error("Invalid session ID.", code="invalid_session_id"), status=400)
+
+        try:
+            db.create_session(
+                session_id=session_id,
+                source=source,
+                model=model,
+                system_prompt=system_prompt,
+            )
+            if title:
+                db.set_session_title(session_id, title)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_session_title"), status=400)
+        except Exception as exc:
+            logger.exception("[api_server] POST /api/sessions failed: %s", exc)
+            return web.json_response(
+                _openai_error("Failed to create session.", err_type="server_error", code="session_create_failed"),
+                status=500,
+            )
+
+        session = db.get_session(session_id) or {"id": session_id, "source": source, "model": model}
+        session["is_active"] = True
+        return web.json_response(session, status=201)
+
+    async def _handle_update_session(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/sessions/{session_id} — update session metadata such as title."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable.", err_type="server_error", code="session_db_unavailable"),
+                status=503,
+            )
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        if "title" not in body:
+            return web.json_response(_openai_error("Missing title field.", code="missing_session_title"), status=400)
+        if body["title"] is not None and not isinstance(body["title"], str):
+            return web.json_response(_openai_error("title must be a string.", code="invalid_session_title"), status=400)
+
+        requested_id = request.match_info.get("session_id", "")
+        session_id = db.resolve_session_id(requested_id)
+        if not session_id:
+            return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+
+        try:
+            if not db.set_session_title(session_id, body.get("title")):
+                return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_session_title"), status=400)
+        except Exception as exc:
+            logger.exception("[api_server] PATCH /api/sessions/%s failed: %s", session_id, exc)
+            return web.json_response(
+                _openai_error("Failed to update session.", err_type="server_error", code="session_update_failed"),
+                status=500,
+            )
+
+        session = db.get_session(session_id) or {"id": session_id}
+        last_active = session.get("last_active", session.get("started_at", 0)) or 0
+        session["is_active"] = (
+            session.get("ended_at") is None
+            and isinstance(last_active, (int, float))
+            and (time.time() - last_active) < 300
+        )
+        return web.json_response(session)
+
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/sessions/{session_id} — delete a persisted session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable.", err_type="server_error", code="session_db_unavailable"),
+                status=503,
+            )
+
+        requested_id = request.match_info.get("session_id", "")
+        session_id = db.resolve_session_id(requested_id)
+        if not session_id:
+            return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+
+        try:
+            if not db.delete_session(session_id):
+                return web.json_response(_openai_error("Session not found.", code="session_not_found"), status=404)
+        except Exception as exc:
+            logger.exception("[api_server] DELETE /api/sessions/%s failed: %s", session_id, exc)
+            return web.json_response(
+                _openai_error("Failed to delete session.", err_type="server_error", code="session_delete_failed"),
+                status=500,
+            )
+
+        return web.json_response({"ok": True, "session_id": session_id})
+
+    async def _handle_logs(self, request: "web.Request") -> "web.Response":
+        """GET /api/logs — tail Hermes log files for the web console."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = request.rel_url.query
+        log_file = (query.get("file") or "gateway").strip().lower() or "gateway"
+
+        try:
+            lines = max(1, min(int(query.get("lines", "160")), MAX_LOG_LINES))
+        except ValueError:
+            return web.json_response(_openai_error("Invalid log line count.", code="invalid_log_lines"), status=400)
+
+        level = (query.get("level") or "").strip().upper() or None
+        if level and level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            return web.json_response(_openai_error("Invalid log level.", code="invalid_log_level"), status=400)
+
+        component = (query.get("component") or "").strip().lower() or None
+        session_filter = (query.get("session") or "").strip() or None
+        since_raw = (query.get("since") or "").strip()
+
+        try:
+            from hermes_cli.logs import LOG_FILES, _parse_since, _read_tail
+        except Exception as exc:
+            logger.exception("[api_server] log helpers unavailable: %s", exc)
+            return web.json_response(
+                _openai_error("Log viewer unavailable.", err_type="server_error", code="log_helpers_unavailable"),
+                status=500,
+            )
+
+        if log_file not in LOG_FILES:
+            return web.json_response(_openai_error(f"Unknown log file: {log_file}", code="unknown_log_file"), status=400)
+
+        try:
+            from hermes_logging import COMPONENT_PREFIXES
+        except Exception:
+            COMPONENT_PREFIXES = {}
+
+        if component and component not in COMPONENT_PREFIXES:
+            return web.json_response(_openai_error("Unknown log component.", code="unknown_log_component"), status=400)
+
+        since = None
+        if since_raw:
+            since = _parse_since(since_raw)
+            if since is None:
+                return web.json_response(_openai_error("Invalid since filter.", code="invalid_since_filter"), status=400)
+
+        try:
+            from hermes_constants import get_hermes_home
+
+            log_path = get_hermes_home() / "logs" / LOG_FILES[log_file]
+            component_prefixes = COMPONENT_PREFIXES.get(component) if component else None
+            has_filters = bool(level or session_filter or since or component_prefixes)
+            line_items = (
+                _read_tail(
+                    log_path,
+                    lines,
+                    has_filters=has_filters,
+                    min_level=level,
+                    session_filter=session_filter,
+                    since=since,
+                    component_prefixes=component_prefixes,
+                )
+                if log_path.exists()
+                else []
+            )
+        except Exception as exc:
+            logger.exception("[api_server] GET /api/logs failed: %s", exc)
+            return web.json_response(
+                _openai_error("Failed to read logs.", err_type="server_error", code="log_read_failed"),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "file": log_file,
+                "lines": line_items,
+                "requested_lines": lines,
+                "level": level,
+                "component": component,
+                "session": session_filter,
+                "available_files": sorted(LOG_FILES),
+                "available_components": sorted(COMPONENT_PREFIXES),
+                "refreshed_at": time.time(),
+            }
+        )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -1819,6 +2169,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams.pop(run_id, None)
                 self._run_streams_created.pop(run_id, None)
 
+    def _register_routes(self, app: "web.Application") -> None:
+        """Register API server routes on an aiohttp application."""
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/v1/health", self._handle_health)
+        app.router.add_get("/v1/models", self._handle_models)
+        app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+        app.router.add_post("/v1/responses", self._handle_responses)
+        app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
+        app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+        app.router.add_get("/api/sessions", self._handle_list_sessions)
+        app.router.add_post("/api/sessions", self._handle_create_session)
+        app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+        app.router.add_patch("/api/sessions/{session_id}", self._handle_update_session)
+        app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+        app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
+        app.router.add_get("/api/logs", self._handle_logs)
+        app.router.add_get("/api/jobs", self._handle_list_jobs)
+        app.router.add_post("/api/jobs", self._handle_create_job)
+        app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
+        app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
+        app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
+        app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
+        app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
+        app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+        app.router.add_post("/v1/runs", self._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -1833,25 +2210,7 @@ class APIServerAdapter(BasePlatformAdapter):
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
-            self._app.router.add_get("/health", self._handle_health)
-            self._app.router.add_get("/v1/health", self._handle_health)
-            self._app.router.add_get("/v1/models", self._handle_models)
-            self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
-            self._app.router.add_post("/v1/responses", self._handle_responses)
-            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
-            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            # Cron jobs management API
-            self._app.router.add_get("/api/jobs", self._handle_list_jobs)
-            self._app.router.add_post("/api/jobs", self._handle_create_job)
-            self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
-            self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
-            self._app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
-            self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
-            self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
-            self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._register_routes(self._app)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

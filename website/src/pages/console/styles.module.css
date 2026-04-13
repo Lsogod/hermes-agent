@@ -209,6 +209,18 @@
   color: var(--console-text-muted);
 }
 
+.blockHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.55rem;
+}
+
+.blockHeaderRow .blockLabel {
+  margin-bottom: 0;
+}
+
 /* ═══════════════════════════════════════════════════════
    Buttons
    ═══════════════════════════════════════════════════════ */
@@ -272,6 +284,36 @@
   border-color: rgba(252, 165, 165, 0.2);
 }
 
+.viewToggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+  padding: 0 1.1rem 0.75rem;
+}
+
+.viewToggleButton {
+  border-radius: 10px;
+  border: 1px solid var(--console-border);
+  background: var(--console-panel-muted);
+  color: var(--console-text-secondary);
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  font-size: 0.84rem;
+  cursor: pointer;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.viewToggleButton:hover {
+  border-color: rgba(255, 215, 0, 0.18);
+  color: var(--console-text);
+}
+
+.viewToggleButtonActive {
+  background: rgba(255, 215, 0, 0.08);
+  border-color: rgba(255, 215, 0, 0.22);
+  color: var(--console-accent);
+}
+
 /* ═══════════════════════════════════════════════════════
    Session list
    ═══════════════════════════════════════════════════════ */
@@ -296,6 +338,7 @@
 
 .sessionContent {
   flex: 1;
+  display: block;
   min-width: 0;
   text-align: left;
   background: none;
@@ -356,6 +399,44 @@
 .sessionMeta {
   color: var(--console-text-muted);
   font-size: 0.62rem;
+}
+
+.sessionRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.sessionSourceTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 215, 0, 0.14);
+  background: rgba(255, 215, 0, 0.05);
+  color: var(--console-accent);
+  font-size: 0.66rem;
+  line-height: 1.2;
+  font-family: "JetBrains Mono", "SFMono-Regular", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sessionPreview {
+  display: block;
+  margin-top: 0.45rem;
+  color: var(--console-text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.remoteSessionItem {
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
 .promptGrid {
@@ -484,6 +565,16 @@
   background: var(--console-panel-strong);
 }
 
+.messageSystem {
+  background: rgba(116, 127, 255, 0.06);
+  border-color: rgba(116, 127, 255, 0.18);
+}
+
+.messageTool {
+  background: rgba(255, 215, 0, 0.03);
+  border-color: rgba(255, 215, 0, 0.14);
+}
+
 .messageError {
   background: rgba(252, 165, 165, 0.06);
   border-color: rgba(252, 165, 165, 0.15);
@@ -497,9 +588,29 @@
   margin-bottom: 0.5rem;
 }
 
+.messageHeaderMeta {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
 .messageRole {
   font-size: 0.62rem;
   color: var(--console-text-muted);
+}
+
+.messageMetaChip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.16rem 0.42rem;
+  border-radius: 999px;
+  border: 1px solid var(--console-border);
+  background: rgba(255, 215, 0, 0.04);
+  color: var(--console-text-secondary);
+  font-size: 0.66rem;
+  line-height: 1.2;
+  font-family: "JetBrains Mono", "SFMono-Regular", monospace;
 }
 
 .messageTime {
@@ -742,6 +853,13 @@
   border-top: 1px solid var(--console-border);
   padding: 0.85rem 1.1rem 1.1rem;
   background: linear-gradient(180deg, rgba(255, 215, 0, 0.01), transparent);
+}
+
+.readOnlyState {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 215, 0, 0.14);
+  background: rgba(255, 215, 0, 0.03);
+  padding: 0.9rem 0.95rem;
 }
 
 .composer {
@@ -1229,6 +1347,57 @@
   overflow-y: auto;
 }
 
+.logControls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.logMeta {
+  margin: 0.65rem 0 0.55rem;
+  color: var(--console-text-muted);
+  font-size: 0.75rem;
+  font-family: "JetBrains Mono", "SFMono-Regular", monospace;
+}
+
+.logViewer {
+  margin: 0;
+  max-height: min(28vh, 18rem);
+  min-height: 10rem;
+  overflow: auto;
+  padding: 0.8rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--console-border);
+  background: #0a0b12;
+  color: #d7d3ca;
+  font-family: "JetBrains Mono", "SFMono-Regular", monospace;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 215, 0, 0.18) transparent;
+}
+
+.logViewer::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.logViewer::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.logViewer::-webkit-scrollbar-thumb {
+  background: rgba(255, 215, 0, 0.16);
+  border-radius: 999px;
+}
+
+[data-theme='light'] .logViewer {
+  background: rgba(0, 0, 0, 0.035);
+  color: #2b2720;
+}
+
 /* ═══════════════════════════════════════════════════════
    Responsive
    ═══════════════════════════════════════════════════════ */
@@ -1271,6 +1440,11 @@
   }
 
   .modelRow {
+    grid-template-columns: 1fr;
+  }
+
+  .viewToggle,
+  .logControls {
     grid-template-columns: 1fr;
   }
 }

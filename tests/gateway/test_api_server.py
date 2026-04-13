@@ -27,6 +27,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    body_limit_middleware,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -216,16 +217,10 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
-    app.router.add_get("/health", adapter._handle_health)
-    app.router.add_get("/v1/health", adapter._handle_health)
-    app.router.add_get("/v1/models", adapter._handle_models)
-    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
-    app.router.add_post("/v1/responses", adapter._handle_responses)
-    app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
-    app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    adapter._register_routes(app)
     return app
 
 
@@ -345,6 +340,164 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# Session browser + logs endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestConsoleDataEndpoints:
+    @pytest.mark.asyncio
+    async def test_list_sessions_returns_persisted_sessions(self, adapter):
+        now = time.time()
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "wechat-session-123",
+                "source": "wechat",
+                "title": "Alice",
+                "preview": "你好",
+                "started_at": now - 90,
+                "last_active": now - 5,
+                "ended_at": None,
+                "message_count": 3,
+            }
+        ]
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/sessions?exclude_sources=api_server&limit=40")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert len(data["sessions"]) == 1
+        assert data["sessions"][0]["id"] == "wechat-session-123"
+        assert data["sessions"][0]["is_active"] is True
+        mock_db.list_sessions_rich.assert_called_once_with(
+            source=None,
+            exclude_sources=["api_server"],
+            limit=40,
+            offset=0,
+            include_children=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sessions_require_auth_when_configured(self, auth_adapter):
+        auth_adapter._session_db = MagicMock()
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/sessions")
+
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_session_messages_resolve_prefix(self, adapter):
+        mock_db = MagicMock()
+        mock_db.resolve_session_id.return_value = "wechat-session-123"
+        mock_db.get_messages.return_value = [
+            {"id": 1, "role": "user", "content": "hi", "timestamp": 123.0},
+            {"id": 2, "role": "assistant", "content": "hello", "timestamp": 124.0},
+        ]
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/sessions/wechat-session/messages")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["session_id"] == "wechat-session-123"
+        assert len(data["messages"]) == 2
+        mock_db.resolve_session_id.assert_called_once_with("wechat-session")
+        mock_db.get_messages.assert_called_once_with("wechat-session-123")
+
+    @pytest.mark.asyncio
+    async def test_logs_endpoint_reads_gateway_log(self, adapter, tmp_path):
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "gateway.log").write_text(
+            "2026-04-14 00:00:00 INFO gateway.run: connected\n",
+            encoding="utf-8",
+        )
+        app = _create_app(adapter)
+
+        with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/logs?file=gateway&lines=20&component=gateway")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["file"] == "gateway"
+        assert "gateway" in data["available_files"]
+        assert "gateway" in data["available_components"]
+        assert any("connected" in line for line in data["lines"])
+
+    @pytest.mark.asyncio
+    async def test_create_session_returns_new_api_server_session(self, adapter):
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {
+            "id": "web-abc123",
+            "source": "api_server",
+            "title": "新会话",
+            "started_at": time.time(),
+            "ended_at": None,
+        }
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/sessions", json={"session_id": "web-abc123", "title": "新会话"})
+            assert resp.status == 201
+            data = await resp.json()
+
+        assert data["id"] == "web-abc123"
+        assert data["is_active"] is True
+        mock_db.create_session.assert_called_once()
+        mock_db.set_session_title.assert_called_once_with("web-abc123", "新会话")
+
+    @pytest.mark.asyncio
+    async def test_update_session_title(self, adapter):
+        now = time.time()
+        mock_db = MagicMock()
+        mock_db.resolve_session_id.return_value = "web-abc123"
+        mock_db.set_session_title.return_value = True
+        mock_db.get_session.return_value = {
+            "id": "web-abc123",
+            "source": "api_server",
+            "title": "重命名后",
+            "started_at": now - 10,
+            "last_active": now - 2,
+            "ended_at": None,
+        }
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.patch("/api/sessions/web-abc123", json={"title": "重命名后"})
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["title"] == "重命名后"
+        mock_db.set_session_title.assert_called_once_with("web-abc123", "重命名后")
+
+    @pytest.mark.asyncio
+    async def test_delete_session_endpoint(self, adapter):
+        mock_db = MagicMock()
+        mock_db.resolve_session_id.return_value = "web-abc123"
+        mock_db.delete_session.return_value = True
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete("/api/sessions/web-abc123")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {"ok": True, "session_id": "web-abc123"}
+        mock_db.delete_session.assert_called_once_with("web-abc123")
 
 
 # ---------------------------------------------------------------------------

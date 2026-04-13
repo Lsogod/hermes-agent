@@ -2142,8 +2142,8 @@ def _is_service_installed() -> bool:
     return False
 
 
-def _is_service_running() -> bool:
-    """Check if the gateway service is currently running."""
+def _is_managed_service_running() -> bool:
+    """Return True only when a system-managed gateway service is active."""
     if supports_systemd_services():
         user_unit_exists = get_systemd_unit_path(system=False).exists()
         system_unit_exists = get_systemd_unit_path(system=True).exists()
@@ -2180,7 +2180,15 @@ def _is_service_running() -> bool:
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             return False
-    # Check for manual processes
+    return False
+
+
+def _is_service_running() -> bool:
+    """Check if the gateway is currently running in any mode."""
+    if _is_managed_service_running():
+        return True
+    # Fall back to manually started gateway processes when no managed service is
+    # active, so status commands still report foreground runs correctly.
     return len(find_gateway_pids()) > 0
 
 
@@ -2677,8 +2685,10 @@ def gateway_setup():
         print(color("─" * 58, Colors.DIM))
         service_installed = _is_service_installed()
         service_running = _is_service_running()
+        managed_service_running = _is_managed_service_running()
+        manual_gateway_running = service_running and not managed_service_running
 
-        if service_running:
+        if managed_service_running:
             if prompt_yes_no("  Restart the gateway to pick up changes?", True):
                 try:
                     if supports_systemd_services():
@@ -2690,6 +2700,12 @@ def gateway_setup():
                         print_info("Start manually: hermes gateway")
                 except subprocess.CalledProcessError as e:
                     print_error(f"  Restart failed: {e}")
+        elif manual_gateway_running:
+            platform_name = "systemd" if supports_systemd_services() else "launchd" if is_macos() else "service manager"
+            print_info(f"  Gateway is already running manually (not as a {platform_name} service).")
+            print_info("  Restart it manually to pick up changes:")
+            print_info("    hermes gateway stop")
+            print_info("    hermes gateway run")
         elif service_installed:
             if prompt_yes_no("  Start the gateway service?", True):
                 try:

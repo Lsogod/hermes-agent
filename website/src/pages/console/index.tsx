@@ -3,8 +3,10 @@ import Layout from '@theme/Layout';
 import clsx from 'clsx';
 import styles from './styles.module.css';
 
-type MessageRole = 'user' | 'assistant' | 'error';
+type MessageRole = 'user' | 'assistant' | 'error' | 'system' | 'tool';
 type RunStatus = 'idle' | 'connecting' | 'streaming' | 'complete' | 'error' | 'cancelled';
+type SessionView = 'web' | 'gateway';
+type RemoteState = 'idle' | 'loading' | 'ready' | 'error';
 
 interface ChatMessage {
   id: string;
@@ -12,6 +14,7 @@ interface ChatMessage {
   content: string;
   createdAt: number;
   pending?: boolean;
+  toolName?: string;
 }
 
 interface ConsoleSession {
@@ -19,6 +22,8 @@ interface ConsoleSession {
   title: string;
   createdAt: number;
   updatedAt: number;
+  preview?: string;
+  messageCount?: number;
   messages: ChatMessage[];
   toolEvents: ToolEvent[];
   serverSessionId?: string;
@@ -36,6 +41,39 @@ interface ToolEvent {
   error?: boolean;
   args?: string;
   result?: string;
+}
+
+interface GatewaySessionSummary {
+  id: string;
+  source: string;
+  model?: string | null;
+  title?: string | null;
+  preview?: string;
+  started_at: number;
+  ended_at?: number | null;
+  last_active?: number;
+  message_count?: number;
+  is_active?: boolean;
+}
+
+interface GatewayMessageState {
+  status: RemoteState;
+  messages: ChatMessage[];
+  error?: string;
+  refreshedAt?: number;
+}
+
+interface LogViewerState {
+  file: string;
+  level: string;
+  component: string;
+  lines: number;
+  entries: string[];
+  status: RemoteState;
+  error?: string;
+  refreshedAt?: number;
+  availableFiles: string[];
+  availableComponents: string[];
 }
 
 interface ImageAttachment {
@@ -97,6 +135,17 @@ const PERSONALITIES: {name: string; label: string; prompt: string}[] = [
 ];
 
 const REASONING_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+const LOG_LEVEL_OPTIONS = ['', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] as const;
+const DEFAULT_LOG_STATE: LogViewerState = {
+  file: 'gateway',
+  level: '',
+  component: '',
+  lines: 160,
+  entries: [],
+  status: 'idle',
+  availableFiles: ['agent', 'errors', 'gateway'],
+  availableComponents: [],
+};
 
 const QUICK_PROMPTS = [
   '检查当前项目并总结整体架构。',
@@ -144,6 +193,14 @@ function normalizeEndpoint(input: string): string {
     return '';
   }
   return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+}
+
+function normalizeApiRoot(input: string): string {
+  const trimmed = input.trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return '';
+  }
+  return trimmed.endsWith('/v1') ? trimmed.slice(0, -3) : trimmed;
 }
 
 function extractHost(input: string): string {
@@ -201,11 +258,110 @@ function formatRole(role: MessageRole): string {
       return '用户';
     case 'assistant':
       return 'Hermes';
+    case 'system':
+      return '系统';
+    case 'tool':
+      return '工具';
     case 'error':
       return '错误';
     default:
       return role;
   }
+}
+
+function normalizeMessageRole(role: unknown): MessageRole {
+  if (role === 'user' || role === 'assistant' || role === 'error' || role === 'system' || role === 'tool') {
+    return role;
+  }
+  return 'assistant';
+}
+
+function normalizeMessageTimestamp(value: unknown): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return Date.now();
+  }
+  return value > 1_000_000_000_000 ? value : Math.round(value * 1000);
+}
+
+function formatSourceLabel(source: string | null | undefined): string {
+  if (!source) {
+    return 'unknown';
+  }
+  switch (source) {
+    case 'api_server':
+      return 'API Server';
+    case 'wechat':
+      return 'WeChat';
+    case 'telegram':
+      return 'Telegram';
+    case 'discord':
+      return 'Discord';
+    case 'slack':
+      return 'Slack';
+    case 'whatsapp':
+      return 'WhatsApp';
+    case 'cli':
+      return 'CLI';
+    default:
+      return source;
+  }
+}
+
+function formatMessageCount(value: number | undefined): string {
+  return typeof value === 'number' ? `${value} 条消息` : '--';
+}
+
+function mapGatewayMessage(message: Record<string, unknown>): ChatMessage {
+  const toolName = typeof message.tool_name === 'string' ? message.tool_name : undefined;
+  const content = typeof message.content === 'string'
+    ? message.content
+    : toolName
+      ? `工具 ${toolName} 已执行。`
+      : '';
+
+  return {
+    id: `gateway-${String(message.id ?? makeId('msg'))}`,
+    role: normalizeMessageRole(message.role),
+    content,
+    createdAt: normalizeMessageTimestamp(message.timestamp),
+    toolName,
+  };
+}
+
+function usageFromSessionSummary(summary: GatewaySessionSummary & Record<string, unknown>): Usage | undefined {
+  const prompt = typeof summary.input_tokens === 'number' ? summary.input_tokens : undefined;
+  const completion = typeof summary.output_tokens === 'number' ? summary.output_tokens : undefined;
+  const total = typeof summary.total_tokens === 'number'
+    ? summary.total_tokens
+    : (prompt ?? 0) + (completion ?? 0);
+
+  if (prompt == null && completion == null && !total) {
+    return undefined;
+  }
+
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total || undefined,
+  };
+}
+
+function mapWebSessionSummary(
+  summary: GatewaySessionSummary & Record<string, unknown>,
+  existing?: ConsoleSession,
+): ConsoleSession {
+  return {
+    id: summary.id,
+    title: summary.title || summary.preview || existing?.title || '新会话',
+    createdAt: normalizeMessageTimestamp(summary.started_at),
+    updatedAt: normalizeMessageTimestamp(summary.last_active ?? summary.started_at),
+    preview: summary.preview || existing?.preview,
+    messageCount: typeof summary.message_count === 'number' ? summary.message_count : existing?.messageCount,
+    messages: existing?.messages ?? [],
+    toolEvents: existing?.toolEvents ?? [],
+    serverSessionId: summary.id,
+    totalUsage: usageFromSessionSummary(summary) ?? existing?.totalUsage,
+  };
 }
 
 function formatRunStatus(status: RunStatus): string {
@@ -432,6 +588,7 @@ export default function ConsolePage(): React.JSX.Element {
   const [hydrated, setHydrated] = useState(false);
   const [sessions, setSessions] = useState<ConsoleSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
+  const [sessionView, setSessionView] = useState<SessionView>('web');
   const [settings, setSettings] = useState<ConsoleSettings>(DEFAULT_SETTINGS);
   const [composer, setComposer] = useState('');
   const [requestState, setRequestState] = useState<RequestState>({status: 'idle'});
@@ -441,6 +598,14 @@ export default function ConsolePage(): React.JSX.Element {
   });
   const [models, setModels] = useState<string[]>([DEFAULT_MODEL]);
   const [backendMeta, setBackendMeta] = useState<{provider: string; model: string} | null>(null);
+  const [webSessionsState, setWebSessionsState] = useState<RemoteState>('idle');
+  const [webSessionsError, setWebSessionsError] = useState('');
+  const [gatewaySessions, setGatewaySessions] = useState<GatewaySessionSummary[]>([]);
+  const [gatewaySessionsState, setGatewaySessionsState] = useState<RemoteState>('idle');
+  const [gatewaySessionsError, setGatewaySessionsError] = useState('');
+  const [currentGatewaySessionId, setCurrentGatewaySessionId] = useState('');
+  const [gatewayMessagesBySession, setGatewayMessagesBySession] = useState<Record<string, GatewayMessageState>>({});
+  const [logState, setLogState] = useState<LogViewerState>(DEFAULT_LOG_STATE);
 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -463,9 +628,6 @@ export default function ConsolePage(): React.JSX.Element {
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (!raw) {
-        const session = createSession();
-        setSessions([session]);
-        setCurrentSessionId(session.id);
         return;
       }
 
@@ -473,9 +635,10 @@ export default function ConsolePage(): React.JSX.Element {
         settings?: ConsoleSettings;
         sessions?: ConsoleSession[];
         currentSessionId?: string;
+        sessionView?: SessionView;
       };
 
-      const restoredSessions = (parsed.sessions?.length ? parsed.sessions : [createSession()]).map((session) => ({
+      const restoredSessions = (parsed.sessions ?? []).map((session) => ({
         ...session,
         title: session.title === 'New thread' ? '新会话' : session.title,
         toolEvents: Array.isArray(session.toolEvents) ? session.toolEvents : [],
@@ -484,13 +647,11 @@ export default function ConsolePage(): React.JSX.Element {
 
       setSessions(restoredSessions);
       setSettings(restoredSettings);
-      setCurrentSessionId(parsed.currentSessionId && restoredSessions.some((item) => item.id === parsed.currentSessionId)
-        ? parsed.currentSessionId
-        : restoredSessions[0].id);
+      setSessionView(parsed.sessionView === 'gateway' ? 'gateway' : 'web');
+      setCurrentSessionId(parsed.currentSessionId ?? '');
     } catch {
-      const session = createSession();
-      setSessions([session]);
-      setCurrentSessionId(session.id);
+      setSessions([]);
+      setCurrentSessionId('');
     }
   }, []);
 
@@ -505,21 +666,51 @@ export default function ConsolePage(): React.JSX.Element {
         settings,
         sessions,
         currentSessionId,
+        sessionView,
       }),
     );
-  }, [currentSessionId, hydrated, sessions, settings]);
+  }, [currentSessionId, hydrated, sessionView, sessions, settings]);
 
   const currentSession = useMemo(
     () => sessions.find((session) => session.id === currentSessionId) ?? sessions[0],
     [currentSessionId, sessions],
   );
+  const currentGatewaySession = useMemo(
+    () => gatewaySessions.find((session) => session.id === currentGatewaySessionId) ?? gatewaySessions[0],
+    [currentGatewaySessionId, gatewaySessions],
+  );
   const toolEvents = currentSession?.toolEvents ?? [];
+  const currentGatewayMessageState = currentGatewaySession
+    ? gatewayMessagesBySession[currentGatewaySession.id]
+    : undefined;
 
   useEffect(() => {
     if (!currentSession && sessions.length) {
       setCurrentSessionId(sessions[0].id);
     }
   }, [currentSession, sessions]);
+
+  useEffect(() => {
+    if (!currentGatewaySession && gatewaySessions.length) {
+      setCurrentGatewaySessionId(gatewaySessions[0].id);
+    }
+  }, [currentGatewaySession, gatewaySessions]);
+
+  const endpoint = normalizeEndpoint(settings.endpoint);
+  const apiRoot = normalizeApiRoot(settings.endpoint);
+  const activeMessages = sessionView === 'gateway'
+    ? (currentGatewayMessageState?.messages ?? [])
+    : (currentSession?.messages ?? []);
+  const activeToolEvents = sessionView === 'gateway' ? [] : toolEvents;
+  const transcriptCount = currentSession?.messages.filter((message) => message.role !== 'error').length ?? 0;
+
+  function buildAuthHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const headers = {...extra};
+    if (settings.apiKey.trim()) {
+      headers.Authorization = `Bearer ${settings.apiKey.trim()}`;
+    }
+    return headers;
+  }
 
   function scrollMessagesToBottom(instant?: boolean): void {
     const container = messagesRef.current;
@@ -548,7 +739,7 @@ export default function ConsolePage(): React.JSX.Element {
     }
     // Streaming: instant scroll so it keeps up; otherwise smooth
     scrollMessagesToBottom(requestState.status === 'streaming');
-  }, [currentSession?.messages, requestState.status, toolEvents]);
+  }, [activeMessages, activeToolEvents, requestState.status]);
 
   // Always scroll to bottom when user sends a new message
   useEffect(() => {
@@ -557,9 +748,6 @@ export default function ConsolePage(): React.JSX.Element {
       scrollMessagesToBottom(true);
     }
   }, [requestState.status]);
-
-  const transcriptCount = currentSession?.messages.filter((message) => message.role !== 'error').length ?? 0;
-  const endpoint = normalizeEndpoint(settings.endpoint);
 
   function patchSession(sessionId: string, updater: (session: ConsoleSession) => ConsoleSession): void {
     setSessions((prev) => prev.map((session) => (
@@ -650,10 +838,10 @@ export default function ConsolePage(): React.JSX.Element {
   }
 
   async function probeModels(): Promise<void> {
-    if (!endpoint || !settings.apiKey.trim()) {
+    if (!endpoint) {
       setConnectionState({
         state: 'error',
-        message: '请先填写接口地址和 API Key。',
+        message: '请先填写接口地址。',
       });
       return;
     }
@@ -665,9 +853,7 @@ export default function ConsolePage(): React.JSX.Element {
 
     try {
       const response = await fetch(`${endpoint}/models`, {
-        headers: {
-          Authorization: `Bearer ${settings.apiKey.trim()}`,
-        },
+        headers: buildAuthHeaders(),
       });
 
       const payload = await response.json();
@@ -711,7 +897,364 @@ export default function ConsolePage(): React.JSX.Element {
       return;
     }
     void probeModels();
-  }, [hydrated]);
+  }, [hydrated, endpoint, settings.apiKey]);
+
+  async function fetchWebSessions(silent = false): Promise<void> {
+    if (!apiRoot) {
+      return;
+    }
+    if (!silent) {
+      setWebSessionsState('loading');
+      setWebSessionsError('');
+    }
+
+    try {
+      const response = await fetch(
+        `${apiRoot}/api/sessions?source=${encodeURIComponent('api_server')}&limit=80`,
+        {headers: buildAuthHeaders()},
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Web session fetch failed with ${response.status}`));
+      }
+
+      const items = Array.isArray(payload?.sessions) ? payload.sessions as Array<GatewaySessionSummary & Record<string, unknown>> : [];
+      setSessions((prev) => {
+        const previousById = new Map(prev.map((session) => [session.serverSessionId || session.id, session]));
+        return items.map((session) => mapWebSessionSummary(session, previousById.get(session.id)));
+      });
+      setWebSessionsState('ready');
+      setWebSessionsError('');
+      setCurrentSessionId((prev) => {
+        if (prev && items.some((item) => item.id === prev)) {
+          return prev;
+        }
+        return items[0]?.id ?? '';
+      });
+    } catch (error) {
+      setWebSessionsState('error');
+      setWebSessionsError(error instanceof Error ? error.message : '无法加载 Web 会话。');
+    }
+  }
+
+  async function fetchWebSessionMessages(sessionId: string, silent = false): Promise<void> {
+    if (!apiRoot || !sessionId) {
+      return;
+    }
+
+    patchSession(sessionId, (session) => ({
+      ...session,
+      messages: silent && session.messages.length ? session.messages : [],
+    }));
+
+    try {
+      const response = await fetch(`${apiRoot}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+        headers: buildAuthHeaders(),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Message fetch failed with ${response.status}`));
+      }
+
+      const items = Array.isArray(payload?.messages) ? payload.messages : [];
+      patchSession(sessionId, (session) => ({
+        ...session,
+        updatedAt: Date.now(),
+        messages: items.map((message: Record<string, unknown>) => mapGatewayMessage(message)),
+        messageCount: items.length,
+        preview: session.preview || (typeof items[0]?.content === 'string' ? items[0].content.slice(0, 80) : session.preview),
+      }));
+    } catch (error) {
+      if (!silent) {
+        setRequestState({
+          status: 'error',
+          startedAt: Date.now(),
+          endedAt: Date.now(),
+          error: error instanceof Error ? error.message : '无法加载 Web 会话消息。',
+        });
+      }
+    }
+  }
+
+  async function createPersistedWebSession(title = '新会话'): Promise<ConsoleSession | null> {
+    if (!apiRoot) {
+      setConnectionState({
+        state: 'error',
+        message: '请先填写接口地址。',
+      });
+      return null;
+    }
+
+    try {
+      const response = await fetch(`${apiRoot}/api/sessions`, {
+        method: 'POST',
+        headers: buildAuthHeaders({'Content-Type': 'application/json'}),
+        body: JSON.stringify({
+          title,
+          source: 'api_server',
+          model: settings.model || DEFAULT_MODEL,
+          system_prompt: settings.systemPrompt || undefined,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Session create failed with ${response.status}`));
+      }
+
+      const session = mapWebSessionSummary(payload as GatewaySessionSummary & Record<string, unknown>);
+      setSessions((prev) => [session, ...prev.filter((item) => item.id !== session.id)]);
+      setCurrentSessionId(session.id);
+      setSessionView('web');
+      return session;
+    } catch (error) {
+      setConnectionState({
+        state: 'error',
+        message: error instanceof Error ? error.message : '无法创建 Web 会话。',
+      });
+      return null;
+    }
+  }
+
+  async function updatePersistedWebSession(sessionId: string, title: string): Promise<void> {
+    if (!apiRoot || !sessionId) {
+      return;
+    }
+    try {
+      const response = await fetch(`${apiRoot}/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'PATCH',
+        headers: buildAuthHeaders({'Content-Type': 'application/json'}),
+        body: JSON.stringify({title}),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Session update failed with ${response.status}`));
+      }
+
+      patchSession(sessionId, (session) => ({
+        ...session,
+        title: (payload.title as string) || title,
+        updatedAt: normalizeMessageTimestamp(payload.last_active ?? payload.started_at ?? Date.now()),
+      }));
+    } catch {
+      // Keep local title; failure is non-fatal.
+    }
+  }
+
+  async function deletePersistedWebSession(sessionId: string): Promise<void> {
+    if (!apiRoot || !sessionId) {
+      return;
+    }
+
+    const response = await fetch(`${apiRoot}/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+      headers: buildAuthHeaders(),
+    });
+    if (!response.ok) {
+      let message = `Delete failed with ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = parseErrorMessage(payload, message);
+      } catch {
+        // Ignore response parsing failure.
+      }
+      throw new Error(message);
+    }
+  }
+
+  async function fetchGatewaySessions(silent = false): Promise<void> {
+    if (!apiRoot) {
+      return;
+    }
+    if (!silent) {
+      setGatewaySessionsState('loading');
+      setGatewaySessionsError('');
+    }
+
+    try {
+      const response = await fetch(
+        `${apiRoot}/api/sessions?exclude_sources=${encodeURIComponent('api_server')}&limit=80`,
+        {
+          headers: buildAuthHeaders(),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Session fetch failed with ${response.status}`));
+      }
+
+      const items = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      setGatewaySessions(items as GatewaySessionSummary[]);
+      setGatewaySessionsState('ready');
+      setGatewaySessionsError('');
+      setCurrentGatewaySessionId((prev) => {
+        if (prev && items.some((item: GatewaySessionSummary) => item.id === prev)) {
+          return prev;
+        }
+        return items[0]?.id ?? '';
+      });
+    } catch (error) {
+      setGatewaySessionsState('error');
+      setGatewaySessionsError(error instanceof Error ? error.message : '无法加载服务端会话。');
+    }
+  }
+
+  async function fetchGatewayMessages(sessionId: string, silent = false): Promise<void> {
+    if (!apiRoot || !sessionId) {
+      return;
+    }
+
+    setGatewayMessagesBySession((prev) => ({
+      ...prev,
+      [sessionId]: {
+        status: silent && prev[sessionId]?.messages?.length ? prev[sessionId].status : 'loading',
+        messages: prev[sessionId]?.messages ?? [],
+        error: undefined,
+        refreshedAt: prev[sessionId]?.refreshedAt,
+      },
+    }));
+
+    try {
+      const response = await fetch(`${apiRoot}/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+        headers: buildAuthHeaders(),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Message fetch failed with ${response.status}`));
+      }
+
+      const items = Array.isArray(payload?.messages) ? payload.messages : [];
+      setGatewayMessagesBySession((prev) => ({
+        ...prev,
+        [sessionId]: {
+          status: 'ready',
+          messages: items.map((message: Record<string, unknown>) => mapGatewayMessage(message)),
+          error: undefined,
+          refreshedAt: Date.now(),
+        },
+      }));
+    } catch (error) {
+      setGatewayMessagesBySession((prev) => ({
+        ...prev,
+        [sessionId]: {
+          status: 'error',
+          messages: prev[sessionId]?.messages ?? [],
+          error: error instanceof Error ? error.message : '无法加载会话消息。',
+          refreshedAt: prev[sessionId]?.refreshedAt,
+        },
+      }));
+    }
+  }
+
+  async function fetchLogs(silent = false): Promise<void> {
+    if (!apiRoot) {
+      return;
+    }
+
+    setLogState((prev) => ({
+      ...prev,
+      status: silent && prev.entries.length ? prev.status : 'loading',
+      error: undefined,
+    }));
+
+    const params = new URLSearchParams({
+      file: logState.file,
+      lines: String(logState.lines),
+    });
+    if (logState.level) {
+      params.set('level', logState.level);
+    }
+    if (logState.component) {
+      params.set('component', logState.component);
+    }
+
+    try {
+      const response = await fetch(`${apiRoot}/api/logs?${params.toString()}`, {
+        headers: buildAuthHeaders(),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, `Log fetch failed with ${response.status}`));
+      }
+
+      setLogState((prev) => ({
+        ...prev,
+        entries: Array.isArray(payload?.lines) ? payload.lines : [],
+        status: 'ready',
+        error: undefined,
+        refreshedAt: Date.now(),
+        availableFiles: Array.isArray(payload?.available_files) && payload.available_files.length
+          ? payload.available_files
+          : prev.availableFiles,
+        availableComponents: Array.isArray(payload?.available_components)
+          ? payload.available_components
+          : prev.availableComponents,
+      }));
+    } catch (error) {
+      setLogState((prev) => ({
+        ...prev,
+        status: 'error',
+        error: error instanceof Error ? error.message : '无法读取日志。',
+      }));
+    }
+  }
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    void fetchWebSessions();
+    const timer = window.setInterval(() => {
+      void fetchWebSessions(true);
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [apiRoot, hydrated, settings.apiKey]);
+
+  useEffect(() => {
+    if (!hydrated || !currentSessionId) {
+      return;
+    }
+    if (requestState.status === 'connecting' || requestState.status === 'streaming') {
+      return;
+    }
+    void fetchWebSessionMessages(currentSessionId);
+    const timer = window.setInterval(() => {
+      void fetchWebSessionMessages(currentSessionId, true);
+    }, sessionView === 'web' ? 5000 : 15000);
+    return () => window.clearInterval(timer);
+  }, [apiRoot, currentSessionId, hydrated, requestState.status, sessionView, settings.apiKey]);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    void fetchGatewaySessions();
+    const timer = window.setInterval(() => {
+      void fetchGatewaySessions(true);
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [apiRoot, hydrated, settings.apiKey]);
+
+  useEffect(() => {
+    if (!hydrated || !currentGatewaySessionId) {
+      return;
+    }
+    void fetchGatewayMessages(currentGatewaySessionId);
+    const timer = window.setInterval(() => {
+      void fetchGatewayMessages(currentGatewaySessionId, true);
+    }, sessionView === 'gateway' ? 5000 : 15000);
+    return () => window.clearInterval(timer);
+  }, [apiRoot, currentGatewaySessionId, hydrated, sessionView, settings.apiKey]);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    void fetchLogs();
+    const timer = window.setInterval(() => {
+      void fetchLogs(true);
+    }, 6000);
+    return () => window.clearInterval(timer);
+  }, [apiRoot, hydrated, logState.component, logState.file, logState.level, logState.lines, settings.apiKey]);
 
   async function consumeStreamingResponse(
     response: Response,
@@ -840,19 +1383,24 @@ export default function ConsolePage(): React.JSX.Element {
   }
 
   async function sendMessage(text: string): Promise<void> {
-    if (!currentSession || !text.trim() || requestState.status === 'connecting' || requestState.status === 'streaming') {
+    if (!text.trim() || requestState.status === 'connecting' || requestState.status === 'streaming') {
       return;
     }
 
-    if (!endpoint || !settings.apiKey.trim()) {
+    if (!endpoint) {
       setConnectionState({
         state: 'error',
-        message: '发送前请先填写接口地址和 API Key。',
+        message: '发送前请先填写接口地址。',
       });
       return;
     }
 
-    const sessionId = currentSession.id;
+    const ensuredSession = currentSession ?? await createPersistedWebSession();
+    if (!ensuredSession) {
+      return;
+    }
+
+    const sessionId = ensuredSession.serverSessionId ?? ensuredSession.id;
     const now = Date.now();
     const userMessage: ChatMessage = {
       id: makeId('user'),
@@ -870,7 +1418,7 @@ export default function ConsolePage(): React.JSX.Element {
     };
 
     const outboundMessages = buildRequestMessages(
-      [...currentSession.messages, userMessage],
+      [userMessage],
       settings.systemPrompt,
     );
 
@@ -890,6 +1438,9 @@ export default function ConsolePage(): React.JSX.Element {
       title: session.messages.length === 0 ? summarizeSessionTitle(text) : session.title,
       updatedAt: now,
       messages: [...session.messages, userMessage, assistantMessage],
+      messageCount: (session.messageCount ?? session.messages.length) + 2,
+      preview: text.trim(),
+      serverSessionId: session.serverSessionId ?? session.id,
     }));
 
     setComposer('');
@@ -905,11 +1456,9 @@ export default function ConsolePage(): React.JSX.Element {
     try {
       const requestHeaders: Record<string, string> = {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${settings.apiKey.trim()}`,
+        ...buildAuthHeaders(),
       };
-      if (currentSession.serverSessionId) {
-        requestHeaders['X-Hermes-Session-Id'] = currentSession.serverSessionId;
-      }
+      requestHeaders['X-Hermes-Session-Id'] = sessionId;
 
       const response = await fetch(`${endpoint}/chat/completions`, {
         method: 'POST',
@@ -975,6 +1524,15 @@ export default function ConsolePage(): React.JSX.Element {
           totalUsage: accumulateUsage(session.totalUsage, requestUsage),
         }));
       }
+
+      if (ensuredSession.messages.length === 0) {
+        const nextTitle = summarizeSessionTitle(text);
+        patchSession(sessionId, (session) => ({...session, title: nextTitle}));
+        void updatePersistedWebSession(sessionId, nextTitle);
+      }
+
+      void fetchWebSessionMessages(sessionId, true);
+      void fetchWebSessions(true);
 
       setConnectionState({
         state: 'ready',
@@ -1048,49 +1606,25 @@ export default function ConsolePage(): React.JSX.Element {
       insertInfoMessage(`## 📋 可用命令\n\n- ${lines}\n\n> 在输入框中键入 \`/\` 可快速选择命令。`);
 
     } else if (cmd === '/clear') {
-      clearCurrentSession();
+      void clearCurrentSession();
 
     } else if (cmd === '/new') {
-      createNewSession();
+      void createNewSession();
 
     } else if (cmd === '/retry') {
       if (!currentSession) return;
-      const lastUserMsg = [...currentSession.messages].reverse().find((m) => m.role === 'user');
-      if (!lastUserMsg) {
-        insertInfoMessage('⚠️ 没有可重发的用户消息。');
-      } else {
-        // Remove the last user+assistant pair and resend
-        const msgs = currentSession.messages;
-        const lastUserIdx = msgs.lastIndexOf(lastUserMsg);
-        patchCurrentSession((s) => ({
-          ...s,
-          updatedAt: Date.now(),
-          messages: s.messages.slice(0, lastUserIdx),
-        }));
-        setComposer('');
-        setShowSlashMenu(false);
-        setTimeout(() => void sendMessage(lastUserMsg.content), 50);
-        return;
-      }
+      insertInfoMessage('⚠️ 持久化 Web 会话当前不支持 `/retry`，因为服务端历史已经写入 SessionDB。请直接重新发送一条消息。');
+      setComposer('');
+      setShowSlashMenu(false);
+      return;
 
     } else if (cmd === '/undo') {
       if (!currentSession || currentSession.messages.length === 0) {
         insertInfoMessage('⚠️ 没有可撤销的对话。');
       } else {
-        // Remove last user+assistant pair
-        const msgs = [...currentSession.messages];
-        let removed = 0;
-        while (msgs.length > 0 && removed < 2) {
-          const last = msgs[msgs.length - 1];
-          if (last.role === 'user' || last.role === 'assistant') removed++;
-          msgs.pop();
-        }
-        patchCurrentSession((s) => ({
-          ...s,
-          updatedAt: Date.now(),
-          messages: msgs,
-        }));
-        insertInfoMessage('↩️ 已撤销最近一轮对话。');
+        insertInfoMessage('⚠️ 持久化 Web 会话当前不支持 `/undo`，因为服务端历史已经写入 SessionDB。请新建会话或删除当前会话。');
+        setComposer('');
+        setShowSlashMenu(false);
         return;
       }
 
@@ -1099,6 +1633,9 @@ export default function ConsolePage(): React.JSX.Element {
         insertInfoMessage(`当前标题: **${currentSession?.title ?? '新会话'}**\n\n用法: \`/title 新标题\``);
       } else {
         patchCurrentSession((s) => ({...s, title: arg, updatedAt: Date.now()}));
+        if (currentSession?.id) {
+          void updatePersistedWebSession(currentSession.id, arg);
+        }
         insertInfoMessage(`✏️ 会话标题已更新为: **${arg}**`);
       }
 
@@ -1302,52 +1839,51 @@ export default function ConsolePage(): React.JSX.Element {
     }
   }
 
-  function deleteSession(sessionId: string): void {
+  async function deleteSession(sessionId: string): Promise<void> {
+    const hadOtherSessions = sessions.some((session) => session.id !== sessionId);
     if (requestState.status === 'streaming' || requestState.status === 'connecting') {
       if (sessionId === currentSessionId) {
         stopCurrentRun();
       }
     }
-    setSessions((prev) => {
-      const next = prev.filter((session) => session.id !== sessionId);
-      if (!next.length) {
-        const fresh = createSession();
-        setCurrentSessionId(fresh.id);
-        return [fresh];
+    try {
+      await deletePersistedWebSession(sessionId);
+      setSessions((prev) => {
+        const next = prev.filter((session) => session.id !== sessionId);
+        if (sessionId === currentSessionId) {
+          const sorted = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+          setCurrentSessionId(sorted[0]?.id ?? '');
+        }
+        return next;
+      });
+      setRequestState({status: 'idle'});
+      void fetchWebSessions(true);
+      if (sessionId === currentSessionId && !hadOtherSessions) {
+        void createNewSession();
       }
-      if (sessionId === currentSessionId) {
-        const sorted = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
-        setCurrentSessionId(sorted[0].id);
-      }
-      return next;
-    });
-    setRequestState({status: 'idle'});
+    } catch (error) {
+      setConnectionState({
+        state: 'error',
+        message: error instanceof Error ? error.message : '删除会话失败。',
+      });
+    }
   }
 
-  function createNewSession(): void {
-    const session = createSession();
-    setSessions((prev) => [session, ...prev]);
-    setCurrentSessionId(session.id);
+  async function createNewSession(): Promise<void> {
+    await createPersistedWebSession();
+    setSessionView('web');
     setComposer('');
     setRequestState({status: 'idle'});
   }
 
-  function clearCurrentSession(): void {
+  async function clearCurrentSession(): Promise<void> {
     if (!currentSession) {
       return;
     }
     if (currentSession.messages.length > 0 && !window.confirm('确认清空当前会话的所有消息？')) {
       return;
     }
-    patchCurrentSession((session) => ({
-      ...session,
-      title: '新会话',
-      updatedAt: Date.now(),
-      messages: [],
-      toolEvents: [],
-      serverSessionId: undefined,
-      totalUsage: undefined,
-    }));
+    await deleteSession(currentSession.id);
     setComposer('');
     setRequestState({status: 'idle'});
   }
@@ -1357,16 +1893,34 @@ export default function ConsolePage(): React.JSX.Element {
   }
 
   const sessionItems = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+  const gatewaySessionItems = [...gatewaySessions].sort(
+    (a, b) => (b.last_active ?? b.started_at ?? 0) - (a.last_active ?? a.started_at ?? 0),
+  );
   const filteredSessions = useMemo(() => {
     if (!sessionSearch.trim()) return sessionItems;
     const q = sessionSearch.trim().toLowerCase();
     return sessionItems.filter((s) =>
       s.title.toLowerCase().includes(q) ||
+      (s.preview ?? '').toLowerCase().includes(q) ||
       s.messages.some((m) => m.content.toLowerCase().includes(q)),
     );
   }, [sessionItems, sessionSearch]);
+  const filteredGatewaySessions = useMemo(() => {
+    if (!sessionSearch.trim()) return gatewaySessionItems;
+    const q = sessionSearch.trim().toLowerCase();
+    return gatewaySessionItems.filter((session) =>
+      (session.title ?? '').toLowerCase().includes(q) ||
+      (session.preview ?? '').toLowerCase().includes(q) ||
+      formatSourceLabel(session.source).toLowerCase().includes(q),
+    );
+  }, [gatewaySessionItems, sessionSearch]);
   const lastUsage = requestState.usage;
   const totalUsage = currentSession?.totalUsage;
+  const isGatewayView = sessionView === 'gateway';
+  const visibleMessages = activeMessages;
+  const selectedRemoteMeta = currentGatewaySession;
+  const selectedRemoteState = currentGatewayMessageState;
+  const sessionListCount = isGatewayView ? filteredGatewaySessions.length : filteredSessions.length;
 
   return (
     <Layout
@@ -1379,8 +1933,9 @@ export default function ConsolePage(): React.JSX.Element {
             <span className={styles.heroEyebrow}>浏览器控制台</span>
             <h1 className={styles.heroTitle}>Hermes 网页控制台</h1>
             <p className={styles.heroText}>
-              一个面向操作者的中性色 Hermes 前端。会话保存在当前浏览器里，回复支持实时流式返回，
-              工具执行进度也能在右侧直接观察，不需要离开文档站。
+              一个面向操作者的 Hermes 控制台。除了浏览器里的 Web 会话，这里也能镜像查看
+              Hermes SessionDB 中的服务端会话，例如微信、Telegram、Slack，并直接查看 agent /
+              gateway / errors 日志，不需要离开文档站。
             </p>
           </div>
           <div className={styles.heroStats}>
@@ -1396,17 +1951,19 @@ export default function ConsolePage(): React.JSX.Element {
               <span className={styles.heroStatValue}>
                 {sessionItems.length}
                 <span className={styles.heroStatSep}>/</span>
-                {transcriptCount}
+                {gatewaySessionItems.length}
               </span>
-              <span className={styles.heroStatLabel}>会话 / 消息</span>
+              <span className={styles.heroStatLabel}>Web / Gateway 会话</span>
             </div>
             <div className={styles.heroStat}>
               <span className={styles.heroStatValue}>
-                {totalUsage?.total_tokens != null
-                  ? totalUsage.total_tokens.toLocaleString()
-                  : '--'}
+                {isGatewayView
+                  ? formatSourceLabel(selectedRemoteMeta?.source)
+                  : (totalUsage?.total_tokens != null
+                    ? totalUsage.total_tokens.toLocaleString()
+                    : 'Web Session')}
               </span>
-              <span className={styles.heroStatLabel}>累计 Token</span>
+              <span className={styles.heroStatLabel}>{isGatewayView ? '当前来源' : '累计 Token'}</span>
             </div>
           </div>
         </section>
@@ -1416,10 +1973,33 @@ export default function ConsolePage(): React.JSX.Element {
             <div className={styles.panelHeader}>
               <div>
                 <p className={styles.panelEyebrow}>会话</p>
-                <h2 className={styles.panelTitle}>本地线程列表</h2>
+                <h2 className={styles.panelTitle}>{isGatewayView ? '服务端会话镜像' : '持久化 Web 会话'}</h2>
               </div>
-              <button className={styles.primaryButton} type="button" onClick={createNewSession}>
-                新建会话
+              {isGatewayView ? (
+                <button className={styles.ghostButton} type="button" onClick={() => void fetchGatewaySessions()}>
+                  刷新列表
+                </button>
+              ) : (
+                <button className={styles.primaryButton} type="button" onClick={() => { void createNewSession(); }}>
+                  新建会话
+                </button>
+              )}
+            </div>
+
+            <div className={styles.viewToggle}>
+              <button
+                type="button"
+                className={clsx(styles.viewToggleButton, !isGatewayView && styles.viewToggleButtonActive)}
+                onClick={() => setSessionView('web')}
+              >
+                Web 会话
+              </button>
+              <button
+                type="button"
+                className={clsx(styles.viewToggleButton, isGatewayView && styles.viewToggleButtonActive)}
+                onClick={() => setSessionView('gateway')}
+              >
+                Gateway 会话
               </button>
             </div>
 
@@ -1427,7 +2007,7 @@ export default function ConsolePage(): React.JSX.Element {
               <input
                 type="text"
                 className={styles.sessionSearchInput}
-                placeholder="搜索会话..."
+                placeholder={isGatewayView ? '搜索来源、标题或预览...' : '搜索会话...'}
                 value={sessionSearch}
                 onChange={(e) => setSessionSearch(e.target.value)}
               />
@@ -1441,12 +2021,16 @@ export default function ConsolePage(): React.JSX.Element {
             </div>
 
             <div className={styles.sessionList}>
-              {filteredSessions.length === 0 && sessionSearch ? (
+              {sessionListCount === 0 ? (
                 <div className={styles.traceEmpty} style={{textAlign: 'center', fontSize: '0.85rem'}}>
-                  未找到匹配的会话
+                  {sessionSearch
+                    ? '未找到匹配的会话'
+                    : (isGatewayView
+                      ? (gatewaySessionsState === 'loading' ? '正在加载服务端会话...' : '暂时没有可镜像的服务端会话')
+                      : (webSessionsState === 'loading' ? '正在加载 Web 会话...' : '当前没有持久化 Web 会话'))}
                 </div>
               ) : null}
-              {filteredSessions.map((session) => (
+              {!isGatewayView && filteredSessions.map((session) => (
                 <div
                   key={session.id}
                   className={clsx(styles.sessionItem, session.id === currentSession?.id && styles.sessionItemActive)}
@@ -1457,98 +2041,185 @@ export default function ConsolePage(): React.JSX.Element {
                     onClick={() => {
                       setCurrentSessionId(session.id);
                       setRequestState({status: 'idle'});
+                      setSessionView('web');
                     }}
                   >
                     <span className={styles.sessionTitle}>{session.title}</span>
                     <span className={styles.sessionMeta}>
-                      {session.messages.length} 条消息 · {formatRelativeTime(session.updatedAt)}
+                      {(session.messageCount ?? session.messages.length)} 条消息 · {formatRelativeTime(session.updatedAt)}
                     </span>
+                    {session.preview ? <span className={styles.sessionPreview}>{session.preview}</span> : null}
                   </button>
                   <button
                     type="button"
                     className={styles.sessionDeleteBtn}
                     title="删除会话"
-                    onClick={() => deleteSession(session.id)}
+                    onClick={() => { void deleteSession(session.id); }}
                   >
                     ×
                   </button>
                 </div>
               ))}
+              {isGatewayView && filteredGatewaySessions.map((session) => (
+                <button
+                  key={session.id}
+                  type="button"
+                  className={clsx(styles.sessionItem, styles.remoteSessionItem, session.id === currentGatewaySession?.id && styles.sessionItemActive)}
+                  onClick={() => {
+                    setCurrentGatewaySessionId(session.id);
+                    void fetchGatewayMessages(session.id);
+                  }}
+                >
+                  <span className={styles.sessionContent}>
+                    <span className={styles.sessionRow}>
+                      <span className={styles.sessionTitle}>{session.title || session.id}</span>
+                      <span className={styles.sessionSourceTag}>{formatSourceLabel(session.source)}</span>
+                    </span>
+                    <span className={styles.sessionMeta}>
+                      {formatMessageCount(session.message_count)} · {formatRelativeTime(normalizeMessageTimestamp(session.last_active ?? session.started_at))}
+                    </span>
+                    {session.preview ? <span className={styles.sessionPreview}>{session.preview}</span> : null}
+                  </span>
+                </button>
+              ))}
             </div>
 
-            <div className={styles.panelBlock}>
-              <p className={styles.blockLabel}>快捷提示</p>
-              <div className={styles.promptGrid}>
-                {QUICK_PROMPTS.map((prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    className={styles.promptChip}
-                    onClick={() => setComposer(prompt)}
-                  >
-                    {prompt}
-                  </button>
-                ))}
+            {!isGatewayView ? (
+              <>
+                <div className={styles.panelBlock}>
+                  <p className={styles.blockLabel}>快捷提示</p>
+                  <div className={styles.promptGrid}>
+                    {QUICK_PROMPTS.map((prompt) => (
+                      <button
+                        key={prompt}
+                        type="button"
+                        className={styles.promptChip}
+                        onClick={() => setComposer(prompt)}
+                      >
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className={styles.panelBlock}>
+                  <p className={styles.blockLabel}>启动检查</p>
+                  <ul className={styles.checkList}>
+                    <li>在 <code>~/.hermes/.env</code> 里设置 <code>API_SERVER_ENABLED=true</code>。</li>
+                    <li>如果浏览器直接请求 Hermes，需要给当前来源开放 CORS。</li>
+                    <li>启动 <code>hermes gateway</code>，然后检测 <code>/v1/models</code>。</li>
+                  </ul>
+                  {webSessionsError ? <p className={styles.errorNote}>{webSessionsError}</p> : null}
+                </div>
+              </>
+            ) : (
+              <div className={styles.panelBlock}>
+                <p className={styles.blockLabel}>镜像说明</p>
+                <p className={styles.noteText}>
+                  这里读取的是 Hermes `SessionDB` 中的服务端会话。适合查看刚接入的微信等平台消息，
+                  当前为只读镜像，不会替代原平台的收发链路。
+                </p>
+                {gatewaySessionsError ? <p className={styles.errorNote}>{gatewaySessionsError}</p> : null}
               </div>
-            </div>
-
-            <div className={styles.panelBlock}>
-              <p className={styles.blockLabel}>启动检查</p>
-              <ul className={styles.checkList}>
-                <li>在 <code>~/.hermes/.env</code> 里设置 <code>API_SERVER_ENABLED=true</code>。</li>
-                <li>如果浏览器直接请求 Hermes，需要给当前来源开放 CORS。</li>
-                <li>启动 <code>hermes gateway</code>，然后检测 <code>/v1/models</code>。</li>
-              </ul>
-            </div>
+            )}
           </aside>
 
           <main className={clsx(styles.panel, styles.chatPanel)}>
             <div className={styles.chatHeader}>
               <div>
-                <p className={styles.panelEyebrow}>对话</p>
-                <h2 className={styles.panelTitle}>{currentSession?.title ?? '新会话'}</h2>
+                <p className={styles.panelEyebrow}>{isGatewayView ? '平台会话' : '对话'}</p>
+                <h2 className={styles.panelTitle}>
+                  {isGatewayView
+                    ? (selectedRemoteMeta?.title || selectedRemoteMeta?.id || '未选择会话')
+                    : (currentSession?.title ?? '新会话')}
+                </h2>
               </div>
               <div className={styles.chatHeaderActions}>
-                <button className={styles.ghostButton} type="button" onClick={clearCurrentSession}>
-                  清空会话
-                </button>
-                {requestState.status === 'connecting' || requestState.status === 'streaming' ? (
-                  <button className={styles.dangerButton} type="button" onClick={stopCurrentRun}>
-                    停止运行
-                  </button>
-                ) : null}
+                {isGatewayView ? (
+                  <>
+                    <button
+                      className={styles.ghostButton}
+                      type="button"
+                      onClick={() => {
+                        if (currentGatewaySessionId) {
+                          void fetchGatewayMessages(currentGatewaySessionId);
+                        }
+                      }}
+                      disabled={!currentGatewaySessionId}
+                    >
+                      刷新会话
+                    </button>
+                    <button className={styles.ghostButton} type="button" onClick={() => setSessionView('web')}>
+                      切回 Web
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className={styles.ghostButton} type="button" onClick={() => { void clearCurrentSession(); }}>
+                      清空会话
+                    </button>
+                    {requestState.status === 'connecting' || requestState.status === 'streaming' ? (
+                      <button className={styles.dangerButton} type="button" onClick={stopCurrentRun}>
+                        停止运行
+                      </button>
+                    ) : null}
+                  </>
+                )}
               </div>
             </div>
 
             <div className={styles.messages} ref={messagesRef} onScroll={handleMessagesScroll}>
-              {!currentSession?.messages.length ? (
+              {!visibleMessages.length ? (
                 <div className={styles.emptyState}>
-                  <span className={styles.emptyEyebrow}>等待第一轮输入</span>
-                  <h3>直接在浏览器里和 Hermes 对话。</h3>
-                  <p>
-                    这个页面会把 OpenAI 兼容请求直接发到 Hermes API Server。
-                    线程历史保存在当前浏览器里，而 Hermes 仍然使用完整工具集运行。
-                  </p>
-                  <pre className={styles.commandBlock}>
-                    <code>{`API_SERVER_ENABLED=true
+                  <span className={styles.emptyEyebrow}>{isGatewayView ? '等待服务端会话' : '等待第一轮输入'}</span>
+                  {isGatewayView ? (
+                    <>
+                      <h3>这里会镜像显示 Hermes 服务端会话。</h3>
+                      <p>
+                        打开左侧的 Gateway 会话后，消息会从 API server 的 `/api/sessions/*` 接口读取。
+                        如果刚接入了微信等平台，会在进入 SessionDB 后出现在这里。
+                      </p>
+                      {selectedRemoteState?.status === 'loading' ? (
+                        <p className={styles.noteText}>正在加载会话消息...</p>
+                      ) : null}
+                      {selectedRemoteState?.error ? (
+                        <p className={styles.errorNote}>{selectedRemoteState.error}</p>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      <h3>直接在浏览器里和 Hermes 对话。</h3>
+                      <p>
+                        这个页面会把 OpenAI 兼容请求直接发到 Hermes API Server。
+                        Web 会话现在会持久化到 Hermes 的 SessionDB，不再依赖当前浏览器的 localStorage。
+                      </p>
+                      <pre className={styles.commandBlock}>
+                        <code>{`API_SERVER_ENABLED=true
 API_SERVER_KEY=change-me-local-dev
 API_SERVER_CORS_ORIGINS=http://localhost:3000
 hermes gateway`}</code>
-                  </pre>
+                      </pre>
+                    </>
+                  )}
                 </div>
               ) : (
-                currentSession?.messages.map((message) => (
+                visibleMessages.map((message) => (
                   <article
                     key={message.id}
                     className={clsx(
                       styles.messageCard,
                       message.role === 'user' && styles.messageUser,
                       message.role === 'assistant' && styles.messageAssistant,
+                      message.role === 'system' && styles.messageSystem,
+                      message.role === 'tool' && styles.messageTool,
                       message.role === 'error' && styles.messageError,
                     )}
                   >
                     <div className={styles.messageHeader}>
-                      <span className={styles.messageRole}>{formatRole(message.role)}</span>
+                      <div className={styles.messageHeaderMeta}>
+                        <span className={styles.messageRole}>{formatRole(message.role)}</span>
+                        {message.toolName ? <span className={styles.messageMetaChip}>{message.toolName}</span> : null}
+                      </div>
                       <span className={styles.messageTime}>{new Date(message.createdAt).toLocaleTimeString()}</span>
                     </div>
                     <div className={styles.messageBody}>
@@ -1564,105 +2235,113 @@ hermes gateway`}</code>
             </div>
 
             <div className={styles.composerWrap}>
-              <label className={styles.composerLabel} htmlFor="hermes-console-composer">
-                输入消息
-              </label>
-
-              {/* Image preview */}
-              {imageAttachment && (
-                <div className={styles.imagePreview}>
-                  <img src={imageAttachment.dataUrl} alt={imageAttachment.name} className={styles.imagePreviewThumb} />
-                  <span className={styles.imagePreviewName}>{imageAttachment.name}</span>
-                  <span className={styles.imagePreviewSize}>
-                    {imageAttachment.size < 1024 * 1024
-                      ? `${(imageAttachment.size / 1024).toFixed(0)} KB`
-                      : `${(imageAttachment.size / 1024 / 1024).toFixed(1)} MB`}
-                  </span>
-                  <button type="button" className={styles.imageRemoveBtn} onClick={() => setImageAttachment(null)}>×</button>
+              {isGatewayView ? (
+                <div className={styles.readOnlyState}>
+                  <p className={styles.composerLabel}>只读镜像</p>
+                  <p className={styles.noteText}>
+                    当前正在查看 Hermes 服务端会话。这里不会直接回写到微信等平台，适合排查消息流、
+                    对比 SessionDB 和结合右侧日志做诊断。
+                  </p>
                 </div>
-              )}
+              ) : (
+                <>
+                  <label className={styles.composerLabel} htmlFor="hermes-console-composer">
+                    输入消息
+                  </label>
 
-              {/* Slash command menu */}
-              {showSlashMenu && filteredSlashCommands.length > 0 && (
-                <div className={styles.slashMenu}>
-                  {filteredSlashCommands.map((cmd, idx) => (
-                    <button
-                      key={cmd.name}
-                      type="button"
-                      className={clsx(styles.slashItem, idx === slashSelectedIdx && styles.slashItemActive)}
-                      onMouseEnter={() => setSlashSelectedIdx(idx)}
-                      onClick={() => executeSlashCommand(cmd.name)}
-                    >
-                      <span className={styles.slashName}>{cmd.name}</span>
-                      <span className={styles.slashDesc}>{cmd.description}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
+                  {imageAttachment && (
+                    <div className={styles.imagePreview}>
+                      <img src={imageAttachment.dataUrl} alt={imageAttachment.name} className={styles.imagePreviewThumb} />
+                      <span className={styles.imagePreviewName}>{imageAttachment.name}</span>
+                      <span className={styles.imagePreviewSize}>
+                        {imageAttachment.size < 1024 * 1024
+                          ? `${(imageAttachment.size / 1024).toFixed(0)} KB`
+                          : `${(imageAttachment.size / 1024 / 1024).toFixed(1)} MB`}
+                      </span>
+                      <button type="button" className={styles.imageRemoveBtn} onClick={() => setImageAttachment(null)}>×</button>
+                    </div>
+                  )}
 
-              <textarea
-                id="hermes-console-composer"
-                className={styles.composer}
-                rows={1}
-                value={composer}
-                placeholder="输入消息，或键入 / 使用命令..."
-                onChange={(event) => {
-                  const val = event.target.value;
-                  setComposer(val);
-                  // Slash command detection
-                  if (val.startsWith('/')) {
-                    setShowSlashMenu(true);
-                    setSlashFilter(val);
-                    setSlashSelectedIdx(0);
-                  } else {
-                    setShowSlashMenu(false);
-                  }
-                  // Auto-grow
-                  const el = event.target;
-                  el.style.height = 'auto';
-                  el.style.height = `${Math.min(el.scrollHeight, 192)}px`;
-                }}
-                onKeyDown={handleComposerKeyDown}
-                onPaste={handleComposerPaste}
-              />
+                  {showSlashMenu && filteredSlashCommands.length > 0 && (
+                    <div className={styles.slashMenu}>
+                      {filteredSlashCommands.map((cmd, idx) => (
+                        <button
+                          key={cmd.name}
+                          type="button"
+                          className={clsx(styles.slashItem, idx === slashSelectedIdx && styles.slashItemActive)}
+                          onMouseEnter={() => setSlashSelectedIdx(idx)}
+                          onClick={() => executeSlashCommand(cmd.name)}
+                        >
+                          <span className={styles.slashName}>{cmd.name}</span>
+                          <span className={styles.slashDesc}>{cmd.description}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
 
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                style={{display: 'none'}}
-                onChange={handleImageUpload}
-              />
-
-              <div className={styles.composerActions}>
-                <p className={styles.composerHint}>
-                  Enter 发送 · Shift+Enter 换行 · 键入 / 查看命令 · 可粘贴或上传图片
-                </p>
-                <div className={styles.composerButtons}>
-                  <button
-                    className={styles.ghostButton}
-                    type="button"
-                    title="上传图片"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    📎
-                  </button>
-                  <button
-                    className={styles.primaryButton}
-                    type="button"
-                    onClick={() => {
-                      if (composer.startsWith('/')) {
-                        executeSlashCommand(composer.trim());
+                  <textarea
+                    id="hermes-console-composer"
+                    className={styles.composer}
+                    rows={1}
+                    value={composer}
+                    placeholder="输入消息，或键入 / 使用命令..."
+                    onChange={(event) => {
+                      const val = event.target.value;
+                      setComposer(val);
+                      if (val.startsWith('/')) {
+                        setShowSlashMenu(true);
+                        setSlashFilter(val);
+                        setSlashSelectedIdx(0);
                       } else {
-                        void sendMessage(composer);
+                        setShowSlashMenu(false);
                       }
+                      const el = event.target;
+                      el.style.height = 'auto';
+                      el.style.height = `${Math.min(el.scrollHeight, 192)}px`;
                     }}
-                    disabled={!composer.trim() || requestState.status === 'connecting' || requestState.status === 'streaming'}
-                  >
-                    发送
-                  </button>
-                </div>
-              </div>
+                    onKeyDown={handleComposerKeyDown}
+                    onPaste={handleComposerPaste}
+                  />
+
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    style={{display: 'none'}}
+                    onChange={handleImageUpload}
+                  />
+
+                  <div className={styles.composerActions}>
+                    <p className={styles.composerHint}>
+                      Enter 发送 · Shift+Enter 换行 · 键入 / 查看命令 · 可粘贴或上传图片
+                    </p>
+                    <div className={styles.composerButtons}>
+                      <button
+                        className={styles.ghostButton}
+                        type="button"
+                        title="上传图片"
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        📎
+                      </button>
+                      <button
+                        className={styles.primaryButton}
+                        type="button"
+                        onClick={() => {
+                          if (composer.startsWith('/')) {
+                            executeSlashCommand(composer.trim());
+                          } else {
+                            void sendMessage(composer);
+                          }
+                        }}
+                        disabled={!composer.trim() || requestState.status === 'connecting' || requestState.status === 'streaming'}
+                      >
+                        发送
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </main>
 
@@ -1670,7 +2349,7 @@ hermes gateway`}</code>
             <div className={styles.panelHeader}>
               <div>
                 <p className={styles.panelEyebrow}>运行时</p>
-                <h2 className={styles.panelTitle}>连接与执行追踪</h2>
+                <h2 className={styles.panelTitle}>连接、追踪与日志</h2>
               </div>
               <span
                 className={clsx(
@@ -1752,31 +2431,70 @@ hermes gateway`}</code>
             <div className={styles.panelBlock}>
               <p className={styles.blockLabel}>运行摘要</p>
               <div className={styles.metricGrid}>
-                <div className={styles.metricCard}>
-                  <span className={styles.metricLabel}>状态</span>
-                  <span className={styles.metricValue}>{formatRunStatus(requestState.status)}</span>
-                </div>
-                <div className={styles.metricCard}>
-                  <span className={styles.metricLabel}>耗时</span>
-                  <span className={styles.metricValue}>{formatDuration(requestState)}</span>
-                </div>
-                <div className={styles.metricCard}>
-                  <span className={styles.metricLabel}>输入 Token</span>
-                  <span className={styles.metricValue}>{lastUsage?.prompt_tokens?.toLocaleString() ?? '--'}</span>
-                </div>
-                <div className={styles.metricCard}>
-                  <span className={styles.metricLabel}>输出 Token</span>
-                  <span className={styles.metricValue}>{lastUsage?.completion_tokens?.toLocaleString() ?? '--'}</span>
-                </div>
+                {isGatewayView ? (
+                  <>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>来源</span>
+                      <span className={styles.metricValue}>{formatSourceLabel(selectedRemoteMeta?.source)}</span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>状态</span>
+                      <span className={styles.metricValue}>
+                        {selectedRemoteState?.status === 'loading'
+                          ? '加载中'
+                          : selectedRemoteState?.status === 'error'
+                            ? '读取失败'
+                            : (selectedRemoteMeta?.is_active ? '活跃' : '已归档')}
+                      </span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>消息数</span>
+                      <span className={styles.metricValue}>{formatMessageCount(selectedRemoteMeta?.message_count)}</span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>最后活跃</span>
+                      <span className={styles.metricValue}>
+                        {selectedRemoteMeta?.last_active
+                          ? formatRelativeTime(normalizeMessageTimestamp(selectedRemoteMeta.last_active))
+                          : '--'}
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>状态</span>
+                      <span className={styles.metricValue}>{formatRunStatus(requestState.status)}</span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>耗时</span>
+                      <span className={styles.metricValue}>{formatDuration(requestState)}</span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>输入 Token</span>
+                      <span className={styles.metricValue}>{lastUsage?.prompt_tokens?.toLocaleString() ?? '--'}</span>
+                    </div>
+                    <div className={styles.metricCard}>
+                      <span className={styles.metricLabel}>输出 Token</span>
+                      <span className={styles.metricValue}>{lastUsage?.completion_tokens?.toLocaleString() ?? '--'}</span>
+                    </div>
+                  </>
+                )}
               </div>
 
-              {requestState.error ? <p className={styles.errorNote}>{requestState.error}</p> : null}
+              {isGatewayView
+                ? (selectedRemoteState?.error ? <p className={styles.errorNote}>{selectedRemoteState.error}</p> : null)
+                : (requestState.error ? <p className={styles.errorNote}>{requestState.error}</p> : null)}
             </div>
 
             <div className={styles.panelBlock}>
               <p className={styles.blockLabel}>工具追踪</p>
               <div className={styles.traceList}>
-                {!toolEvents.length ? (
+                {isGatewayView ? (
+                  <div className={styles.traceEmpty}>
+                    实时工具追踪只对当前浏览器发起的 Web 会话生效。服务端平台会话的工具输出可在消息流和下方日志里排查。
+                  </div>
+                ) : !toolEvents.length ? (
                   <div className={styles.traceEmpty}>
                     Hermes 会把工具启动事件作为自定义 SSE 推送到这里展示，不会污染会话历史。
                   </div>
@@ -1820,6 +2538,68 @@ hermes gateway`}</code>
                   ))
                 )}
               </div>
+            </div>
+
+            <div className={styles.panelBlock}>
+              <div className={styles.blockHeaderRow}>
+                <p className={styles.blockLabel}>Hermes 日志</p>
+                <button className={styles.ghostButton} type="button" onClick={() => void fetchLogs()}>
+                  刷新日志
+                </button>
+              </div>
+              <div className={styles.logControls}>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>文件</span>
+                  <select
+                    className={styles.fieldInput}
+                    value={logState.file}
+                    onChange={(event) => setLogState((prev) => ({...prev, file: event.target.value}))}
+                  >
+                    {logState.availableFiles.map((file) => (
+                      <option key={file} value={file}>
+                        {file}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>级别</span>
+                  <select
+                    className={styles.fieldInput}
+                    value={logState.level}
+                    onChange={(event) => setLogState((prev) => ({...prev, level: event.target.value}))}
+                  >
+                    {LOG_LEVEL_OPTIONS.map((level) => (
+                      <option key={level || 'all'} value={level}>
+                        {level || '全部'}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>组件</span>
+                  <select
+                    className={styles.fieldInput}
+                    value={logState.component}
+                    onChange={(event) => setLogState((prev) => ({...prev, component: event.target.value}))}
+                  >
+                    <option value="">全部</option>
+                    {logState.availableComponents.map((component) => (
+                      <option key={component} value={component}>
+                        {component}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <p className={styles.logMeta}>
+                自动刷新 6 秒
+                {logState.refreshedAt ? ` · 最近更新 ${new Date(logState.refreshedAt).toLocaleTimeString()}` : ''}
+              </p>
+              {logState.error ? <p className={styles.errorNote}>{logState.error}</p> : null}
+              <pre className={styles.logViewer}>
+                {logState.entries.length ? logState.entries.join('') : '暂无匹配日志。'}
+              </pre>
             </div>
 
             <div className={styles.panelBlock}>
