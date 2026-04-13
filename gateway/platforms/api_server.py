@@ -571,19 +571,43 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # Expose the real provider/model so web consoles can display it.
+        backend_model = ""
+        backend_provider = ""
+        try:
+            from gateway.run import _resolve_gateway_model, _load_gateway_config
+            backend_model = _resolve_gateway_model() or ""
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, dict):
+                backend_provider = model_cfg.get("provider", "")
+        except Exception:
+            pass
+
+        provider = backend_provider
+        actual_model = backend_model
+        if not provider and "/" in backend_model:
+            provider, actual_model = backend_model.split("/", 1)
+
+        model_obj: Dict[str, Any] = {
+            "id": self._model_name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": provider or "hermes",
+            "permission": [],
+            "root": self._model_name,
+            "parent": None,
+        }
+        if backend_model or provider:
+            model_obj["meta"] = {
+                "provider": provider or "unknown",
+                "model": actual_model or self._model_name,
+                "backend": backend_model,
+            }
+
         return web.json_response({
             "object": "list",
-            "data": [
-                {
-                    "id": self._model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": self._model_name,
-                    "parent": None,
-                }
-            ],
+            "data": [model_obj],
         })
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -722,18 +746,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 history.  Clients that don't understand the custom event type
                 silently ignore it per the SSE specification.
                 """
-                if event_type != "tool.started":
-                    return
-                if name.startswith("_"):
+                if name and name.startswith("_"):
                     return
                 from agent.display import get_tool_emoji
-                emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(("__tool_progress__", {
-                    "tool": name,
-                    "emoji": emoji,
-                    "label": label,
-                }))
+                emoji = get_tool_emoji(name) if name else ""
+                if event_type == "tool.started":
+                    label = preview or name
+                    payload = {
+                        "type": "started",
+                        "tool": name,
+                        "emoji": emoji,
+                        "label": label,
+                    }
+                    if args:
+                        args_str = str(args) if not isinstance(args, str) else args
+                        if len(args_str) > 500:
+                            args_str = args_str[:500] + "..."
+                        payload["args"] = args_str
+                    _stream_q.put(("__tool_progress__", payload))
+                elif event_type == "tool.completed":
+                    duration = kwargs.get("duration", 0)
+                    is_error = kwargs.get("is_error", False)
+                    _stream_q.put(("__tool_progress__", {
+                        "type": "completed",
+                        "tool": name or "",
+                        "emoji": emoji,
+                        "duration": round(duration, 3) if duration else None,
+                        "error": is_error,
+                    }))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.

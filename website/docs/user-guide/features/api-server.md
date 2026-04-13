@@ -49,6 +49,8 @@ curl http://localhost:8642/v1/chat/completions \
 
 Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI integration guide](/docs/user-guide/messaging/open-webui) for step-by-step instructions.
 
+If you want a lightweight first-party browser client inside the docs site, open the built-in [Hermes Web Console](/console). It talks directly to the same API server and is useful for local testing, demos, and operator workflows. When using it from a different origin than the API server, remember to allow that origin with `API_SERVER_CORS_ORIGINS`.
+
 ## Endpoints
 
 ### POST /v1/chat/completions

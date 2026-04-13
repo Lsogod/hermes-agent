@@ -85,6 +85,11 @@ const config: Config = {
           label: 'Docs',
         },
         {
+          to: '/console',
+          label: 'Console',
+          position: 'left',
+        },
+        {
           to: '/skills',
           label: 'Skills',
           position: 'left',
